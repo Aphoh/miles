@@ -493,7 +493,7 @@ class TestRocmWorkflowScopeSeam:
         stage = workflow.split("  stage-c-4-gpu-mi350:", 1)[1]
         command = stage.split("execute_command:", 1)[1].split("secrets:", 1)[0]
 
-        assert "needs: [resolve-ci-policy, resolve-ci-image]" in stage
+        assert "needs: [resolve-ci-policy, resolve-ci-image, resolve-ci-deps]" in stage
         assert "allow_self_hosted" not in stage
         assert "partition_id: [0, 1]" in stage
         assert "max-parallel: ${{ needs.resolve-ci-policy.outputs.cadence == 'weekly' && 1 || 2 }}" in stage
@@ -505,6 +505,10 @@ class TestRocmWorkflowScopeSeam:
         assert "WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}" in stage
         assert "needs.resolve-ci-policy.result == 'success'" in stage
         assert "needs.resolve-ci-image.result == 'success'" in stage
+        assert "needs.resolve-ci-deps.result == 'success'" in stage
+        assert (
+            "skip_dependency_install: ${{ needs.resolve-ci-deps.outputs.skip_dependency_install == 'true' }}" in stage
+        )
         assert (
             "!contains(fromJSON(needs.resolve-ci-policy.outputs.skipped_stages || '[]'), 'stage-c-4-gpu-mi350')"
             in stage
@@ -517,6 +521,23 @@ class TestRocmWorkflowScopeSeam:
         assert "persist-credentials: false" in reusable
         assert "allow-unsafe-pr-checkout" not in reusable
         assert "MILES_HARDWARE_PLATFORM: rocm" in reusable
+
+    def test_megatron_override_preserves_rocm_patch(self):
+        reusable = (Path(__file__).resolve().parents[3] / ".github" / "workflows" / "_run-ci-rocm.yml").read_text()
+        override = reusable.split('if [ -n "$MEGATRON_PR" ]; then', 1)[1].split("          cd $GITHUB_WORKSPACE", 1)[0]
+
+        checkout = override.index("git checkout -f FETCH_HEAD")
+        check_patch = override.index('git apply --check "$GITHUB_WORKSPACE/docker/amd_patch/latest/megatron.patch"')
+        apply_patch = override.index('git apply "$GITHUB_WORKSPACE/docker/amd_patch/latest/megatron.patch"')
+        reverse_check = override.index(
+            'elif git apply --reverse --check "$GITHUB_WORKSPACE/docker/amd_patch/latest/megatron.patch"; then'
+        )
+        error = override.index('echo "::error::Selected Megatron ref is incompatible with the ROCm patch"')
+        fail = override.index("exit 1")
+        install = override.index("pip install -e . --no-deps --break-system-packages")
+
+        assert checkout < check_patch < apply_patch < reverse_check < error < fail < install
+        assert "/tmp/amd_patch/megatron.patch" not in override
 
 
 # --- CLI seam: local nightly alias and invalid-suite exit behavior -----------

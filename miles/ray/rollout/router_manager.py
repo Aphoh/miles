@@ -110,8 +110,16 @@ def start_session_server(args):
     if not hf_checkpoint:
         raise ValueError("--use-session-server requires --hf-checkpoint to be set.")
 
+    backend_url = getattr(args, "session_server_backend_url", None)
+    external_backend = (
+        backend_url is not None
+        or getattr(args, "session_server_backend", "sglang-chat") == "dynamo-generate"
+    )
     if getattr(args, "session_server_ip", None) is None:
-        args.session_server_ip = args.sglang_router_ip
+        args.session_server_ip = _wrap_ipv6(get_host_info()[1]) if external_backend else args.sglang_router_ip
+
+    if backend_url is None:
+        backend_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
 
     ip = args.session_server_ip
     ports = _resolve_session_server_ports(getattr(args, "session_server_port", None))
@@ -124,8 +132,6 @@ def start_session_server(args):
     # The canonical driver-side value; rollout code picks from this list.
     args.session_server_ports = ports
 
-    router_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}"
-
     # Spawn all children before waiting on any: each child pays the ~10s
     # transformers import, so N servers start in ~one import of wall-time.
     # spawn (not fork): see start_router for rationale.
@@ -137,7 +143,7 @@ def start_session_server(args):
         child_args.session_server_instance_id = uuid.uuid4().hex
         instance_ids[port] = child_args.session_server_instance_id
         process = multiprocessing.get_context("spawn").Process(
-            target=run_session_server, args=(child_args, router_url)
+            target=run_session_server, args=(child_args, backend_url)
         )
         process.daemon = True
         process.start()
@@ -147,4 +153,10 @@ def start_session_server(args):
     args.session_server_instance_ids = instance_ids
     for port, process in processes:
         wait_for_server_ready(ip, port, process, timeout=30)
-    logger.info(f"Session servers launched at {ip}, ports {ports} ({len(ports)} instances)")
+    logger.info(
+        "Session servers launched at %s, ports %s (%d instances), backend=%s",
+        ip,
+        ports,
+        len(ports),
+        backend_url,
+    )

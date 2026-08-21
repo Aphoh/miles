@@ -4,6 +4,7 @@ import time
 
 from starlette.responses import Response
 
+from miles.rollout.session.dynamo_generate import DynamoGenerateChatAdapter
 from miles.rollout.session.core import (
     JSON_MEDIA_TYPE,
     ProxyRequest,
@@ -15,7 +16,7 @@ from miles.rollout.session.core import (
     prepare_chat_request,
     proxy_result_to_response,
 )
-from miles.rollout.session.errors import SessionNotFoundError, TokenizationError
+from miles.rollout.session.errors import SessionNotFoundError, TokenizationError, UpstreamResponseError
 from miles.rollout.session.samples.codec import COMPUTED_FIELDS_V2, encode_samples
 from miles.rollout.session.types import GetSessionResponse, SessionRecord
 from miles.rollout.session.v2.session_state import (
@@ -42,6 +43,11 @@ class SessionCoreV2(SessionCore):
         # Import-path only in production: function_registry is process-local.
         self.sample_picker = load_function(args.session_sample_picker_path, sync_required=True)
         self.sample_postprocessor = load_function(args.session_sample_postprocessor_path, sync_required=True)
+        self.dynamo_generate_adapter = (
+            DynamoGenerateChatAdapter(registry.tokenizer, args)
+            if getattr(args, "session_server_backend", "sglang-chat") == "dynamo-generate"
+            else None
+        )
 
     def _session_metadata(self, session_id: str, session) -> dict:
         """Mirrors ``core.SessionCore._session_metadata``: token ids come from
@@ -126,6 +132,41 @@ class SessionCoreV2(SessionCore):
             )
         return _samples_response(encode_samples(samples, metadata, fields=COMPUTED_FIELDS_V2))
 
+    async def _dispatch_chat(
+        self, request_body: dict, *, session_id: str, method: str, query: str, headers: dict
+    ) -> dict:
+        if self.dynamo_generate_adapter is None:
+            return await self.backend.do_proxy(
+                ProxyRequest(method=method, query=query),
+                "v1/chat/completions",
+                body=json.dumps(request_body).encode(),
+                headers={**headers, "X-SMG-Routing-Key": session_id},
+            )
+
+        prepared = self.dynamo_generate_adapter.build_generate_request(request_body)
+        generate_body = json.dumps(prepared.payload).encode()
+        dynamo_headers = {
+            **headers,
+            "X-Dynamo-Session-ID": session_id,
+            "X-SMG-Routing-Key": session_id,
+        }
+        result = await self.backend.do_sglang_generate(
+            body=generate_body,
+            headers=dynamo_headers,
+            decode=lambda token_ids: self.dynamo_generate_adapter.decode(
+                token_ids,
+                skip_special_tokens=prepared.request.skip_special_tokens,
+            ),
+        )
+        if result["status_code"] != 200:
+            return result
+        try:
+            native_response = json.loads(result["response_body"])
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise UpstreamResponseError("Dynamo /generate returned invalid aggregate JSON.") from exc
+        response = self.dynamo_generate_adapter.build_chat_response(prepared, native_response)
+        return {**result, "response_body": _render_json(response)}
+
     async def chat_completions(
         self, session_id: str, *, method: str, query: str, headers: dict, body: bytes
     ) -> Response:
@@ -163,14 +204,16 @@ class SessionCoreV2(SessionCore):
 
             self._maybe_request_addition_r3(request_body, session.active_token_ids(), prompt_token_ids)
 
-            proxy_body = json.dumps(request_body).encode()
             attach_parent = session.active_leaf
         # --- lock released ---
 
         # --- Phase 2: proxy to backend (NO lock held) ---
-        headers = {**headers, "X-SMG-Routing-Key": session_id}
-        result = await self.backend.do_proxy(
-            ProxyRequest(method=method, query=query), "v1/chat/completions", body=proxy_body, headers=headers
+        result = await self._dispatch_chat(
+            request_body,
+            session_id=session_id,
+            method=method,
+            query=query,
+            headers=headers,
         )
 
         # Non-200 (e.g. 400 context too long) passes through unrecorded so the
@@ -184,7 +227,12 @@ class SessionCoreV2(SessionCore):
         async with session.lock:
             if session.closing:
                 logger.warning(f"Session {session_id} closed during proxy, skipping state update")
-                return _chat_client_response(result, response, client_stream)
+                return _chat_client_response(
+                    result,
+                    response,
+                    client_stream,
+                    strip_meta_info=self.dynamo_generate_adapter is not None,
+                )
 
             record = SessionRecord(
                 timestamp=time.time(),
@@ -209,4 +257,9 @@ class SessionCoreV2(SessionCore):
             )
         # --- lock released ---
 
-        return _chat_client_response(result, response, client_stream)
+        return _chat_client_response(
+            result,
+            response,
+            client_stream,
+            strip_meta_info=self.dynamo_generate_adapter is not None,
+        )

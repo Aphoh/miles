@@ -15,7 +15,9 @@ import uvicorn
 from fastapi import FastAPI
 
 from miles.rollout.session.core import ProxyRequest
+from miles.rollout.session.errors import UpstreamResponseError
 from miles.rollout.session.sessions import setup_session_routes
+from miles.rollout.session.sglang_stream import consume_sglang_sse
 from miles.utils.logging_utils import configure_logger_raw
 
 logger = logging.getLogger(__name__)
@@ -29,7 +31,7 @@ class SessionServer:
     requests through the inference router (sglang or miles)."""
 
     def __init__(self, args, backend_url: str):
-        self.backend_url = backend_url
+        self.backend_url = backend_url.rstrip("/")
         self.app = FastAPI()
 
         timeout = getattr(args, "miles_router_timeout", 600.0)
@@ -70,6 +72,48 @@ class SessionServer:
             "response_body": content,
             "status_code": response.status_code,
             "headers": dict(response.headers),
+        }
+
+    async def do_sglang_generate(self, *, body: bytes, headers: dict, decode) -> dict:
+        """Consume Dynamo's streaming native ``/generate`` as one response."""
+        url = f"{self.backend_url}/generate"
+        headers = {k: v for k, v in headers.items() if k.lower() not in _DROP_REQUEST_HEADERS}
+
+        try:
+            async with self.client.stream("POST", url, content=body, headers=headers) as response:
+                if response.status_code != 200:
+                    content = await response.aread()
+                    return {
+                        "request_body": body,
+                        "response_body": content,
+                        "status_code": response.status_code,
+                        "headers": dict(response.headers),
+                    }
+                try:
+                    native_response = await consume_sglang_sse(
+                        response.aiter_lines(),
+                        decode=decode,
+                        output_mode="incremental",
+                    )
+                except ValueError as exc:
+                    raise UpstreamResponseError(f"invalid Dynamo /generate stream: {exc}") from exc
+        except httpx.TransportError as exc:
+            logger.warning("Dynamo /generate transport error: %s", exc)
+            error_body = json.dumps(
+                {"error": f"backend transport error: {type(exc).__name__}: {exc}"}
+            ).encode()
+            return {
+                "request_body": body,
+                "response_body": error_body,
+                "status_code": 502,
+                "headers": {"content-type": "application/json"},
+            }
+
+        return {
+            "request_body": body,
+            "response_body": json.dumps(native_response).encode(),
+            "status_code": 200,
+            "headers": {"content-type": "application/json"},
         }
 
 

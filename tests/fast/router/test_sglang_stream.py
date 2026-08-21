@@ -3,7 +3,10 @@ import json
 
 import pytest
 
-from miles.rollout.session.sglang_stream import SGLangStreamAccumulator, consume_sglang_sse
+from miles.rollout.session.sglang_stream import consume_sglang_sse
+
+
+_MISSING = object()
 
 
 async def _lines(*values: str):
@@ -11,42 +14,62 @@ async def _lines(*values: str):
         yield value
 
 
-def test_incremental_sse_accumulates_tokens_and_terminal_metadata():
-    first = {
-        "text": "a",
-        "output_ids": [101],
-        "meta_info": {
-            "output_token_logprobs": [[-0.1, 101, "a"]],
-            "output_token_logprobs_length": 1,
-            "completion_tokens": 1,
-            "finish_reason": None,
-        },
-    }
-    final = {
-        "text": "b",
-        "output_ids": [102],
-        "meta_info": {
-            "output_token_logprobs": [[-0.2, 102, "b"]],
-            "output_token_logprobs_length": 2,
-            "completion_tokens": 2,
-            "finish_reason": {"type": "stop"},
-            "routed_experts": [[1, 2]],
-            "indexer_topk": [[3, 4]],
-        },
-    }
+def _consume_lines(*values: str, decode=lambda token_ids: f"decoded:{token_ids}"):
+    return asyncio.run(consume_sglang_sse(_lines(*values), decode=decode))
 
-    response = asyncio.run(
-        consume_sglang_sse(
-            _lines(
-                f"data: {json.dumps(first)}",
-                "",
-                f"data: {json.dumps(final)}",
-                "",
-                "data: [DONE]",
-                "",
-            ),
-            decode=lambda token_ids: f"decoded:{token_ids}",
-        )
+
+def _consume_chunks(*chunks: dict, decode=lambda token_ids: f"decoded:{token_ids}"):
+    lines = [line for chunk in chunks for line in (f"data: {json.dumps(chunk)}", "")]
+    lines.extend(("data: [DONE]", ""))
+    return _consume_lines(*lines, decode=decode)
+
+
+def _chunk(pairs, length, *, text="", output_ids=_MISSING, top_rows=_MISSING, **meta):
+    meta_info = {
+        "output_token_logprobs": pairs,
+        "output_token_logprobs_length": length,
+        **meta,
+    }
+    if top_rows is not _MISSING:
+        meta_info["output_top_logprobs"] = top_rows
+
+    if output_ids is _MISSING:
+        output_ids = [pair[1] for pair in pairs]
+    chunk = {"text": text, "meta_info": meta_info}
+    if output_ids is not None:
+        chunk["output_ids"] = output_ids
+    return chunk
+
+
+def test_incremental_sse_materializes_complete_native_response():
+    first_top_row = [[-0.1, 101, "a"], [-0.4, 201, "x"]]
+    response = _consume_chunks(
+        _chunk(
+            [[-0.1, 101, "a"]],
+            1,
+            text="a",
+            top_rows=[first_top_row],
+            finish_reason=None,
+            routed_experts="stale",
+        ),
+        _chunk(
+            [[-0.2, 102, "b"]],
+            2,
+            text="b",
+            top_rows=[None],
+            finish_reason=None,
+        ),
+        _chunk(
+            [],
+            2,
+            top_rows=[],
+            completion_tokens=2,
+            finish_reason={"type": "stop"},
+            routed_experts="terminal-routes",
+            indexer_topk="terminal-indexer",
+            weight_version="v7",
+        ),
+        decode=lambda _token_ids: pytest.fail("fully supplied text must not be decoded"),
     )
 
     assert response["text"] == "ab"
@@ -55,80 +78,73 @@ def test_incremental_sse_accumulates_tokens_and_terminal_metadata():
         [-0.1, 101, "a"],
         [-0.2, 102, "b"],
     ]
-    assert response["meta_info"]["routed_experts"] == [[1, 2]]
-    assert response["meta_info"]["indexer_topk"] == [[3, 4]]
+    assert response["meta_info"]["output_top_logprobs"] == [first_top_row, None]
+    assert response["meta_info"]["routed_experts"] == "terminal-routes"
+    assert response["meta_info"]["indexer_topk"] == "terminal-indexer"
+    assert response["meta_info"]["weight_version"] == "v7"
 
 
-def test_cumulative_stream_accepts_repeated_prefix():
-    accumulator = SGLangStreamAccumulator(output_mode="cumulative")
-    accumulator.add(
-        {
-            "text": "a",
-            "output_ids": [101],
-            "meta_info": {
-                "output_token_logprobs": [[-0.1, 101]],
-                "output_token_logprobs_length": 1,
-                "finish_reason": None,
-            },
-        }
-    )
-    accumulator.add(
-        {
-            "text": "ab",
-            "output_ids": [101, 102],
-            "meta_info": {
-                "output_token_logprobs": [[-0.1, 101], [-0.2, 102]],
-                "output_token_logprobs_length": 2,
-                "completion_tokens": 2,
-                "finish_reason": {"type": "length"},
-            },
-        }
+def test_missing_text_decodes_ids_derived_from_logprob_pairs():
+    response = _consume_chunks(
+        _chunk(
+            [[-0.1, 101, "a"]],
+            1,
+            text=None,
+            output_ids=None,
+            finish_reason=None,
+        ),
+        _chunk(
+            [],
+            1,
+            completion_tokens=1,
+            finish_reason={"type": "stop"},
+        ),
     )
 
-    response = accumulator.finish(lambda token_ids: f"decoded:{token_ids}")
-
-    assert response["text"] == "ab"
-    assert response["output_ids"] == [101, 102]
+    assert response["text"] == "decoded:[101]"
+    assert response["output_ids"] == [101]
 
 
-def test_stream_rejects_output_id_disagreement():
-    accumulator = SGLangStreamAccumulator()
-
-    with pytest.raises(ValueError, match="output_ids disagree"):
-        accumulator.add(
-            {
-                "text": "a",
-                "output_ids": [999],
-                "meta_info": {
-                    "output_token_logprobs": [[-0.1, 101]],
-                    "output_token_logprobs_length": 1,
-                },
-            }
-        )
-
-
-def test_stream_rejects_missing_terminal_finish_reason():
-    accumulator = SGLangStreamAccumulator()
-    accumulator.add(
-        {
-            "text": "a",
-            "output_ids": [101],
-            "meta_info": {
-                "output_token_logprobs": [[-0.1, 101]],
-                "output_token_logprobs_length": 1,
-            },
-        }
-    )
-
-    with pytest.raises(ValueError, match="terminal finish_reason"):
-        accumulator.finish(lambda token_ids: "a")
+@pytest.mark.parametrize(
+    ("chunk", "match"),
+    [
+        (
+            _chunk([[-0.1, 101]], 2, finish_reason={"type": "stop"}),
+            "inconsistent output_token_logprobs_length",
+        ),
+        (
+            _chunk([[-0.1, 101]], 1, output_ids=[999], finish_reason={"type": "stop"}),
+            "output_ids disagree",
+        ),
+        (
+            _chunk([[-0.1, 101]], 1, top_rows=[], finish_reason={"type": "stop"}),
+            "one row per output token",
+        ),
+        (
+            _chunk([[-0.1, 101]], 1, completion_tokens=2, finish_reason={"type": "stop"}),
+            "terminal token counts disagree",
+        ),
+        (
+            _chunk([[-0.1, 101]], 1, completion_tokens=1, finish_reason=None),
+            "terminal finish_reason",
+        ),
+    ],
+)
+def test_stream_rejects_inconsistent_token_metadata(chunk, match):
+    with pytest.raises(ValueError, match=match):
+        _consume_chunks(chunk)
 
 
-def test_sse_error_event_is_not_silently_ignored():
-    with pytest.raises(ValueError, match="error event"):
-        asyncio.run(
-            consume_sglang_sse(
-                _lines('event: error', 'data: {"error":{"message":"boom"}}', "", "data: [DONE]", ""),
-                decode=lambda token_ids: "",
-            )
-        )
+@pytest.mark.parametrize(
+    ("lines", "match"),
+    [
+        (("event: error", 'data: {"error":{"message":"boom"}}'), "error event"),
+        (('data: {"error":{"message":"boom"}}',), "error event"),
+        (("data: {not-json}",), "not valid JSON"),
+        (("data: []",), "decode to an object"),
+        (("data: [DONE]",), "without any data chunks"),
+    ],
+)
+def test_sse_rejects_error_or_malformed_events(lines, match):
+    with pytest.raises(ValueError, match=match):
+        _consume_lines(*lines)

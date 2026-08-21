@@ -1,5 +1,7 @@
+import json
 from types import SimpleNamespace
 
+from miles.rollout.session.core import _chat_client_response
 from miles.rollout.session.dynamo_generate import DynamoGenerateChatAdapter
 
 
@@ -74,6 +76,10 @@ def test_build_chat_response_keeps_private_meta_for_miles():
         "prompt_tokens": 3,
         "completion_tokens": 2,
         "output_token_logprobs": [[-0.1, 104, "h"], [-0.2, 105, "i"]],
+        "output_top_logprobs": [
+            [[-0.1, 104, "h"], [-0.3, 120, "x"]],
+            None,
+        ],
         "finish_reason": {"type": "stop"},
         "routed_experts": [[1, 2]],
     }
@@ -85,7 +91,17 @@ def test_build_chat_response_keeps_private_meta_for_miles():
     assert choice["finish_reason"] == "stop"
     assert choice["meta_info"] is meta_info
     assert choice["logprobs"]["content"][0]["token"] == "h"
+    assert [item["token"] for item in choice["logprobs"]["content"][0]["top_logprobs"]] == ["h", "x"]
+    assert choice["logprobs"]["content"][1]["top_logprobs"] == []
     assert response["usage"] == {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5}
+    client_response = _chat_client_response(
+        {"status_code": 200, "headers": {"content-type": "application/json"}},
+        response,
+        client_stream=False,
+        strip_meta_info=True,
+    )
+    assert "meta_info" not in json.loads(client_response.body)["choices"][0]
+    assert choice["meta_info"] is meta_info
 
 
 def test_model_specific_tool_parser_runs_after_generate():

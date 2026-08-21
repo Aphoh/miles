@@ -2545,6 +2545,21 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 "Auto-allocates a single port if not set.",
             )
             parser.add_argument(
+                "--session-server-backend",
+                choices=["sglang-chat", "dynamo-generate"],
+                default="sglang-chat",
+                help="Inference protocol used by Session Server v2. sglang-chat proxies "
+                "/v1/chat/completions; dynamo-generate adapts chat locally over a streaming "
+                "native SGLang /generate endpoint.",
+            )
+            parser.add_argument(
+                "--session-server-backend-url",
+                type=str,
+                default=None,
+                help="Optional inference backend base URL for the session server. "
+                "Defaults to http://<sglang-router-ip>:<sglang-router-port>.",
+            )
+            parser.add_argument(
                 "--tito-model",
                 type=str,
                 default="default",
@@ -2888,6 +2903,12 @@ def miles_validate_args(args):
             "version; pass it bare (or 'v1') for the append-only linear server, or 'v2' for "
             "tree serving."
         )
+
+    if args.session_server_backend == "dynamo-generate" and args.use_session_server != "v2":
+        raise ValueError("--session-server-backend=dynamo-generate requires --use-session-server v2.")
+
+    if args.session_server_backend_url and not args.use_session_server:
+        raise ValueError("--session-server-backend-url requires --use-session-server.")
 
     if args.use_session_server == "v2":
         unsupported = [

@@ -85,6 +85,17 @@ def _strip_replay_payloads(response: dict) -> dict:
     return {**response, "choices": stripped_choices}
 
 
+def _strip_meta_info(response: dict) -> dict:
+    """Remove the private SGLang compatibility lane from every choice."""
+    return {
+        **response,
+        "choices": [
+            {key: value for key, value in choice.items() if key != "meta_info"}
+            for choice in response.get("choices", [])
+        ],
+    }
+
+
 def _response_to_stream_chunk(response: dict) -> dict:
     """Synthesize the single ``chat.completion.chunk`` for a fake stream.
 
@@ -115,7 +126,9 @@ def _response_to_stream_chunk(response: dict) -> dict:
     return chunk
 
 
-def _chat_client_response(result: dict, response: dict, client_stream: bool) -> Response:
+def _chat_client_response(
+    result: dict, response: dict, client_stream: bool, *, strip_meta_info: bool = False
+) -> Response:
     if client_stream:
         sse = b"data: " + _render_json(_response_to_stream_chunk(response)) + b"\n\ndata: [DONE]\n\n"
         # Fresh headers: upstream's headers describe its JSON body, not this SSE body.
@@ -127,8 +140,9 @@ def _chat_client_response(result: dict, response: dict, client_stream: bool) -> 
             media_type="text/event-stream",
         )
     headers = {k: v for k, v in result["headers"].items() if k.lower() not in _DROP_RESPONSE_HEADERS}
+    client_response = _strip_meta_info(response) if strip_meta_info else _strip_replay_payloads(response)
     return Response(
-        content=_render_json(_strip_replay_payloads(response)),
+        content=_render_json(client_response),
         status_code=result["status_code"],
         headers=headers,
         media_type=JSON_MEDIA_TYPE,

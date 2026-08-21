@@ -55,6 +55,7 @@ PR_BODY_PINS = (
 )
 LABEL_PATTERN = re.compile(r"(?:run-ci-[A-Za-z0-9][A-Za-z0-9_.-]*|bypass-fastfail)")
 SHA_PATTERN = re.compile(r"[0-9a-f]{40}")
+WORKFLOW_RUN_URL_PATTERN = re.compile(rf"https://github\.com/{re.escape(REPOSITORY)}/actions/runs/[1-9][0-9]*")
 POLICY_PERMISSIONS = frozenset({"write", "admin"})
 POLICY_GROUPS = frozenset({"add_label_access", "repo_write_access"})
 
@@ -89,6 +90,7 @@ class CommandSpec(NamedTuple):
     allows_user_ids: bool
     audit_key: str
     audit_value: object
+    success_reaction: str
 
 
 class CommandContext(NamedTuple):
@@ -248,6 +250,12 @@ def _positive_int(value, name):
     return value
 
 
+def _validate_workflow_run_url(value):
+    if not isinstance(value, str) or WORKFLOW_RUN_URL_PATTERN.fullmatch(value) is None:
+        raise CommentCommandError("workflow run URL is invalid")
+    return value
+
+
 def parse_event(event):
     if not isinstance(event, dict) or event.get("action") != "created":
         raise CommentCommandError("event must be issue_comment.created")
@@ -286,7 +294,7 @@ class GitHubAPI:
             raise CommentCommandError("GitHub API token is missing")
         self.token = token
 
-    def _request(self, path, *, method="GET", payload=None, expected_status=None, expect_json=True):
+    def _request(self, path, *, method="GET", payload=None, expected_statuses=None, expect_json=True):
         data = None
         if payload is not None:
             data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
@@ -303,10 +311,9 @@ class GitHubAPI:
         )
         try:
             with urllib.request.urlopen(request, timeout=15) as response:
-                if expected_status is not None and response.status != expected_status:
-                    raise CommentCommandError(
-                        f"GitHub API returned HTTP {response.status}; expected {expected_status}"
-                    )
+                if expected_statuses is not None and response.status not in expected_statuses:
+                    expected = " or ".join(str(status) for status in expected_statuses)
+                    raise CommentCommandError(f"GitHub API returned HTTP {response.status}; expected {expected}")
                 body = response.read()
                 if not expect_json:
                     if body.strip():
@@ -401,19 +408,48 @@ class GitHubAPI:
         self._request(
             f"/repos/{REPOSITORY}/actions/runs/{run_id}/rerun-failed-jobs",
             method="POST",
-            expected_status=201,
+            expected_statuses=(201,),
             expect_json=False,
         )
 
     def create_workflow_dispatch(self, workflow_file, ref, inputs):
         encoded_workflow = urllib.parse.quote(workflow_file, safe="")
-        self._request(
+        result = self._request(
             f"/repos/{REPOSITORY}/actions/workflows/{encoded_workflow}/dispatches",
             method="POST",
-            payload={"ref": ref, "inputs": inputs},
-            expected_status=204,
-            expect_json=False,
+            payload={"ref": ref, "inputs": inputs, "return_run_details": True},
+            expected_statuses=(200,),
         )
+        if not isinstance(result, dict):
+            raise CommentCommandError("GitHub API returned invalid workflow dispatch details")
+        run_id = _positive_int(result.get("workflow_run_id"), "workflow run ID")
+        html_url = _validate_workflow_run_url(result.get("html_url"))
+        if (
+            result.get("run_url") != f"{API_ROOT}/repos/{REPOSITORY}/actions/runs/{run_id}"
+            or html_url != f"https://github.com/{REPOSITORY}/actions/runs/{run_id}"
+        ):
+            raise CommentCommandError("GitHub API returned mismatched workflow dispatch details")
+        return html_url
+
+    def add_comment_reaction(self, comment_id, content):
+        result = self._request(
+            f"/repos/{REPOSITORY}/issues/comments/{comment_id}/reactions",
+            method="POST",
+            payload={"content": content},
+            expected_statuses=(200, 201),
+        )
+        if not isinstance(result, dict) or result.get("content") != content:
+            raise CommentCommandError("GitHub API did not confirm the comment reaction")
+
+    def create_issue_comment(self, pull_number, body):
+        result = self._request(
+            f"/repos/{REPOSITORY}/issues/{pull_number}/comments",
+            method="POST",
+            payload={"body": body},
+            expected_statuses=(201,),
+        )
+        if not isinstance(result, dict) or result.get("body") != body:
+            raise CommentCommandError("GitHub API did not confirm the workflow reply")
 
 
 def _validate_live_pull(pull, pull_number):
@@ -802,13 +838,18 @@ def _handle_run_test_file(context, request):
         "test_file": request.test_file,
     }
     inputs.update(_pr_body_pins(context.body))
-    context.api.create_workflow_dispatch(RUN_FILE_WORKFLOW, RUN_FILE_WORKFLOW_REF, inputs)
+    workflow_run_url = context.api.create_workflow_dispatch(
+        RUN_FILE_WORKFLOW,
+        RUN_FILE_WORKFLOW_REF,
+        inputs,
+    )
     return {
         "actor_id": context.actor_id,
         "decision": "ALLOW_FILE_RUN_DISPATCHED",
         "head_sha": context.head_sha,
         "pull_number": context.pull_number,
         "test_file": request.test_file,
+        "workflow_run_url": workflow_run_url,
     }
 
 
@@ -847,6 +888,7 @@ COMMAND_REGISTRY = {
         True,
         "label",
         _add_label_resource,
+        "none",
     ),
     ClearLabels: CommandSpec(
         "clear_labels",
@@ -858,6 +900,7 @@ COMMAND_REGISTRY = {
         False,
         "command",
         _clear_command_value,
+        "none",
     ),
     RerunFailedCI: CommandSpec(
         "rerun_failed_ci",
@@ -869,6 +912,7 @@ COMMAND_REGISTRY = {
         False,
         "command",
         _rerun_command_value,
+        "none",
     ),
     RunTestFile: CommandSpec(
         "run_test_file",
@@ -880,6 +924,7 @@ COMMAND_REGISTRY = {
         False,
         "test_file",
         _run_file_value,
+        "+1",
     ),
 }
 
@@ -933,15 +978,63 @@ def authorize_policy(event, policy, api):
     return pull_number, actor_id, request, spec
 
 
-def _write_capability(capability):
+def acknowledge_event(event, api):
+    pull_number, actor_id, _, request = parse_event(event)
+    spec = _command_spec(request)
+    if spec.success_reaction == "none":
+        raise CommentCommandError("command does not define a success reaction")
+    comment_id = _positive_int(event["comment"].get("id"), "comment ID")
+    api.add_comment_reaction(comment_id, spec.success_reaction)
+    return {
+        "actor_id": actor_id,
+        "decision": "ALLOW_SUCCESS_REACTION_CONFIRMED",
+        "pull_number": pull_number,
+        "reaction": spec.success_reaction,
+    }
+
+
+def reply_event(event, api, workflow_run_url):
+    pull_number, actor_id, _, request = parse_event(event)
+    if type(request) is not RunTestFile:
+        raise CommentCommandError("command does not define a workflow reply")
+    workflow_run_url = _validate_workflow_run_url(workflow_run_url)
+    body = f"Started `/{RUN_FILE_COMMAND} {request.test_file}`.\n\n" f"[View workflow run]({workflow_run_url})"
+    api.create_issue_comment(pull_number, body)
+    return {
+        "actor_id": actor_id,
+        "decision": "ALLOW_WORKFLOW_REPLY_CONFIRMED",
+        "pull_number": pull_number,
+        "workflow_run_url": workflow_run_url,
+    }
+
+
+def _write_routing(capability, success_reaction):
     if capability not in {"none", "issues", "actions"}:
         raise CommentCommandError("command registry selected an unknown capability")
+    if success_reaction not in {"none", "+1"}:
+        raise CommentCommandError("command registry selected an unknown success reaction")
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
         return
     try:
         with Path(output_path).open("a", encoding="utf-8") as output:
             output.write(f"capability={capability}\n")
+            output.write(f"success_reaction={success_reaction}\n")
+    except OSError as error:
+        raise CommentCommandError(f"cannot write GITHUB_OUTPUT: {error}") from error
+
+
+def _write_workflow_run_url(result):
+    workflow_run_url = result.get("workflow_run_url")
+    if workflow_run_url is None:
+        return
+    workflow_run_url = _validate_workflow_run_url(workflow_run_url)
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    try:
+        with Path(output_path).open("a", encoding="utf-8") as output:
+            output.write(f"workflow_run_url={workflow_run_url}\n")
     except OSError as error:
         raise CommentCommandError(f"cannot write GITHUB_OUTPUT: {error}") from error
 
@@ -949,10 +1042,16 @@ def _write_capability(capability):
 def main():
     try:
         event = load_json(os.environ["GITHUB_EVENT_PATH"])
-        if os.environ.get("CI_COMMAND_PREFLIGHT") == "true":
+        if os.environ.get("CI_COMMAND_ACKNOWLEDGE") == "true":
+            api = GitHubAPI(os.environ["CI_COMMAND_API_TOKEN"])
+            result = acknowledge_event(event, api)
+        elif os.environ.get("CI_COMMAND_REPLY") == "true":
+            api = GitHubAPI(os.environ["CI_COMMAND_API_TOKEN"])
+            result = reply_event(event, api, os.environ.get("CI_COMMAND_WORKFLOW_RUN_URL"))
+        elif os.environ.get("CI_COMMAND_PREFLIGHT") == "true":
             pull_number, actor_id, _, request = parse_event(event)
             if request is None:
-                _write_capability("none")
+                _write_routing("none", "none")
                 print(
                     json.dumps(
                         {
@@ -965,14 +1064,12 @@ def main():
                     )
                 )
                 return 0
-
-        policy = load_policy(os.environ["CI_COMMAND_POLICY_PATH"])
-        api = GitHubAPI(os.environ["CI_COMMAND_API_TOKEN"])
-        if os.environ.get("CI_COMMAND_PREFLIGHT") == "true":
+            policy = load_policy(os.environ["CI_COMMAND_POLICY_PATH"])
+            api = GitHubAPI(os.environ["CI_COMMAND_API_TOKEN"])
             pull_number, actor_id, request, spec = authorize_policy(event, policy, api)
             authorization = {"actor_id": actor_id, "pull_number": pull_number}
             authorization[spec.audit_key] = spec.audit_value(request)
-            _write_capability(spec.capability)
+            _write_routing(spec.capability, spec.success_reaction)
             print(
                 json.dumps(
                     authorization,
@@ -981,7 +1078,11 @@ def main():
                 )
             )
             return 0
-        result = process_event(event, policy, api)
+        else:
+            policy = load_policy(os.environ["CI_COMMAND_POLICY_PATH"])
+            api = GitHubAPI(os.environ["CI_COMMAND_API_TOKEN"])
+            result = process_event(event, policy, api)
+            _write_workflow_run_url(result)
     except CommentCommandError as error:
         print(f"::error::{error}")
         return 1

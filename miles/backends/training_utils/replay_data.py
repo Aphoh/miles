@@ -1,9 +1,12 @@
+import logging
 from typing import Protocol
 
 import torch
 
 from .cp_utils import slice_with_cp
 from .parallel import get_parallel_state
+
+logger = logging.getLogger(__name__)
 
 
 class RegisterReplayListFunc(Protocol):
@@ -51,6 +54,12 @@ def fill_replay_data(
     """
     if data_key not in rollout_data:
         raise ValueError(f"{data_key} is required in rollout_data for replay.")
+    if not replay_list:
+        raise ValueError(f"{data_key} replay is enabled but no model replay modules were registered.")
+
+    entries_before = [len(replay.top_indices_list) for replay in replay_list]
+    processed_microbatches = 0
+    replay_stream_count = None
 
     for iterator in data_iterator:
         iterator.reset()
@@ -127,6 +136,26 @@ def fill_replay_data(
             replay_data = replay_data[start:end]
 
         register_replay_list_func(replay_list, replay_data, models=models)
+        processed_microbatches += 1
+        replay_stream_count = int(replay_data.shape[1])
+
+    entry_increments = [
+        len(replay.top_indices_list) - before
+        for replay, before in zip(replay_list, entries_before, strict=True)
+    ]
+    assert all(increment == processed_microbatches for increment in entry_increments), (
+        data_key,
+        processed_microbatches,
+        entry_increments,
+    )
+    logger.info(
+        "Replay data registered: data_key=%s modules=%s streams=%s microbatches=%s entries_per_module=%s",
+        data_key,
+        len(replay_list),
+        replay_stream_count,
+        processed_microbatches,
+        min(entry_increments),
+    )
 
     del rollout_data[data_key]
 

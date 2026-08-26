@@ -16,8 +16,13 @@ import torch
 from miles.backends.megatron_utils.update_weight.update_weight_from_distributed.broadcast import (
     UpdateWeightFromDistributed,
 )
+from miles.backends.megatron_utils.update_weight.common import (
+    begin_weight_update,
+    end_weight_update,
+)
 
 _MODULE = "miles.backends.megatron_utils.update_weight.update_weight_from_distributed.broadcast"
+_COMMON_MODULE = "miles.backends.megatron_utils.update_weight.common"
 
 
 class _LockState:
@@ -67,6 +72,36 @@ def _passthrough_ray_get(mock_ray, fail_on=None):
 
 def _named_tensors() -> list[tuple[str, torch.Tensor]]:
     return [("layer.weight", torch.zeros(2, 2))]
+
+
+@patch(f"{_COMMON_MODULE}.ray")
+def test_begin_weight_update_rejects_dynamo_reported_failure(mock_ray):
+    mock_ray.get.side_effect = lambda refs: refs
+    engine = MagicMock()
+    engine.begin_weight_update.remote.return_value = {
+        "success": False,
+        "message": "begin FP4 session failed",
+    }
+
+    with pytest.raises(RuntimeError, match="begin FP4 session failed"):
+        begin_weight_update([engine], selector="target")
+
+    engine.begin_weight_update.remote.assert_called_once_with(selector="target")
+
+
+@patch(f"{_COMMON_MODULE}.ray")
+def test_end_weight_update_rejects_dynamo_reported_failure(mock_ray):
+    mock_ray.get.side_effect = lambda refs: refs
+    engine = MagicMock()
+    engine.end_weight_update.remote.return_value = {
+        "success": False,
+        "message": "end FP4 postprocess failed",
+    }
+
+    with pytest.raises(RuntimeError, match="end FP4 postprocess failed"):
+        end_weight_update([engine])
+
+    engine.end_weight_update.remote.assert_called_once_with()
 
 
 @patch(f"{_MODULE}.update_weights_from_distributed")
@@ -148,6 +183,23 @@ def test_engine_failure_on_refs_releases_lock_and_propagates(mock_ray, mock_upda
 
     assert lock_state.locked is False
     assert lock_state.release_calls == 1
+
+
+@patch(f"{_MODULE}.update_weights_from_distributed")
+@patch(f"{_MODULE}.ray")
+def test_engine_reported_failure_releases_lock_and_propagates(mock_ray, mock_update):
+    lock_state = _LockState()
+    _passthrough_ray_get(mock_ray)
+    mock_update.return_value = [{"success": False, "message": "Dynamo rejected weights"}]
+    updater = _make_updater(lock_state)
+    tensors = _named_tensors()
+
+    with pytest.raises(RuntimeError, match="Dynamo rejected weights"):
+        updater._update_weight_implementation(tensors, pbar=None)
+
+    assert lock_state.locked is False
+    assert lock_state.release_calls == 1
+    assert len(tensors) == 1
 
 
 @patch(f"{_MODULE}.update_weights_from_distributed")

@@ -592,6 +592,37 @@ class MegatronTrainRayActor(TrainRayActor):
 
         for m in all_replay_managers:
             if m.enabled:
+                if self._use_rollout_replay(m):
+                    assert m.replays, f"{m.name} replay is enabled but no modules were registered"
+                    entry_counts = [len(replay.top_indices_list) for replay in m.replays]
+                    forward_counts = [replay.forward_index for replay in m.replays]
+                    backward_counts = [replay.backward_index for replay in m.replays]
+                    assert forward_counts == entry_counts, (
+                        m.name,
+                        "forward",
+                        forward_counts,
+                        entry_counts,
+                    )
+                    if self.args.recompute_granularity == "full":
+                        assert backward_counts == entry_counts, (
+                            m.name,
+                            "backward",
+                            backward_counts,
+                            entry_counts,
+                        )
+                    logger.info(
+                        "Rollout replay consumed: name=%s modules=%s "
+                        "min_entries=%s max_entries=%s min_forward=%s max_forward=%s "
+                        "min_backward=%s max_backward=%s",
+                        m.name,
+                        len(m.replays),
+                        min(entry_counts),
+                        max(entry_counts),
+                        min(forward_counts),
+                        max(forward_counts),
+                        min(backward_counts),
+                        max(backward_counts),
+                    )
                 m.clear_all()
 
         if train_step_outcome == TrainStepOutcome.NORMAL:

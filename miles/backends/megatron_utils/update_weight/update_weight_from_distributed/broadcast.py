@@ -117,7 +117,7 @@ class UpdateWeightFromDistributed(DistBucketedWeightUpdateMixin):
                 converted_named_tensors,
                 selector=self._weight_update_selector,
             )
-            ray.get(refs)
+            _check_weight_sync_results(ray.get(refs), is_lora=False)
             converted_named_tensors.clear()
         finally:
             # Leaking this lock makes the next weight sync poll forever, so the

@@ -24,6 +24,43 @@ from miles.utils.replay_base import routing_replay_manager
 logger = logging.getLogger(__name__)
 
 
+def _apply_bridge_yarn_config(provider, args: argparse.Namespace) -> None:
+    """Apply an explicit standard-GPT YaRN CLI configuration in bridge mode.
+
+    The HF checkpoint remains authoritative for ordinary bridge runs. When the
+    CLI explicitly selects YaRN, however, the parsed sequence and YaRN fields
+    must replace the provider values built from the checkpoint.
+    """
+    if getattr(args, "position_embedding_type", None) != "yarn" or getattr(
+        args, "multi_latent_attention", False
+    ):
+        return
+
+    def value_or_default(name: str, default):
+        value = getattr(args, name, None)
+        return default if value is None else value
+
+    provider.seq_length = args.seq_length
+    provider.position_embedding_type = "yarn"
+    provider.yarn_rotary_scaling_factor = value_or_default("rotary_scaling_factor", 1.0)
+    provider.yarn_original_max_position_embeddings = value_or_default(
+        "yarn_original_max_position_embeddings", 4096
+    )
+    provider.yarn_beta_fast = value_or_default("yarn_beta_fast", 32.0)
+    provider.yarn_beta_slow = value_or_default("yarn_beta_slow", 1.0)
+    provider.yarn_mscale = value_or_default("mscale", 1.0)
+    provider.yarn_mscale_all_dim = value_or_default("mscale_all_dim", 0.0)
+    provider.yarn_correction_range_round_to_int = value_or_default(
+        "yarn_correction_range_round_to_int", True
+    )
+    logger.info(
+        "Applied bridge YaRN config: seq_length=%s scaling_factor=%s original_max_position_embeddings=%s",
+        provider.seq_length,
+        provider.yarn_rotary_scaling_factor,
+        provider.yarn_original_max_position_embeddings,
+    )
+
+
 def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     """Copy the runtime config from args onto a bridge-built provider.
 
@@ -48,6 +85,7 @@ def _apply_bridge_runtime_config(provider, args: argparse.Namespace) -> None:
     # loss / sequence handling
     provider.calculate_per_token_loss = args.calculate_per_token_loss  # CP>1 VL models assert this
     provider.variable_seq_lengths = args.variable_seq_lengths
+    _apply_bridge_yarn_config(provider, args)
 
     # numerics (training infra, not model-defining)
     provider.attention_softmax_in_fp32 = args.attention_softmax_in_fp32
